@@ -17,6 +17,7 @@ import {
 } from 'apollo-server-env';
 import { GraphQLDataSource } from '@apollo/gateway';
 import createSHA from 'apollo-server-core/dist/utils/createSHA';
+import { PersistedQuery } from "./persistedQuery";
 
 function isObject(value: any): value is object {
   return (
@@ -117,8 +118,22 @@ export class RemoteGraphQLDataSource<TContext extends Record<string, any> = Reco
         throw parseError;
       }
 
-      const apqOptimisticResponse =
-        await this.sendRequest(requestWithoutQuery, context);
+      if (!optimisticPersistedQueryUrl) {
+        throw new Error(
+            "Failed to generate persisted query URI from request."
+        );
+      }
+
+      requestWithoutQuery.http = {
+        method: "GET",
+        url: optimisticPersistedQueryUrl,
+        headers,
+      };
+
+      const apqOptimisticResponse = await this.sendRequest(
+        requestWithoutQuery,
+        context
+      );
 
       // If we didn't receive notice to retry with APQ, then let's
       // assume this is the best result we'll get and return it!
@@ -181,9 +196,13 @@ export class RemoteGraphQLDataSource<TContext extends Record<string, any> = Reco
     // being transmitted.  Instead, we want those to be used to indicate what
     // we're accessing (e.g. url) and what we access it with (e.g. headers).
     const { http, ...requestWithoutHttp } = request;
+    const requestBody =
+      request.http.method === "POST"
+        ? JSON.stringify(requestWithoutHttp)
+        : undefined;
     const fetchRequest = new Request(http.url, {
       ...http,
-      body: JSON.stringify(requestWithoutHttp),
+      body: requestBody,
     });
 
     let fetchResponse: Response | undefined;
@@ -193,21 +212,21 @@ export class RemoteGraphQLDataSource<TContext extends Record<string, any> = Reco
       // Use the fetcher's `Request` implementation for compatibility
       fetchResponse = await this.fetcher(http.url, {
         ...http,
-        body: JSON.stringify(requestWithoutHttp)
+        body: requestBody
       });
 
       if (!fetchResponse.ok) {
         throw await this.errorFromResponse(fetchResponse);
       }
 
-      const body = await this.parseBody(fetchResponse, fetchRequest, context);
+      const responseBody = await this.parseBody(fetchResponse, fetchRequest, context);
 
-      if (!isObject(body)) {
-        throw new Error(`Expected JSON response body, but received: ${body}`);
+      if (!isObject(responseBody)) {
+        throw new Error(`Expected JSON response body, but received: ${responseBody}`);
       }
 
       return {
-        ...body,
+        ...responseBody,
         http: fetchResponse,
       };
     } catch (error) {
