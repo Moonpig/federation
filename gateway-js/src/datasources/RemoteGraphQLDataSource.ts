@@ -1,305 +1,279 @@
-/* eslint-disable */
-
 import {
-    GraphQLRequestContext,
-    GraphQLResponse,
-    ValueOrPromise,
-    GraphQLRequest,
-} from "apollo-server-types";
+  GraphQLRequestContext,
+  GraphQLResponse,
+  ValueOrPromise,
+  GraphQLRequest,
+} from 'apollo-server-types';
 import {
-    ApolloError,
-    AuthenticationError,
-    ForbiddenError,
-} from "apollo-server-errors";
-import { fetch, Request, Headers, Response } from "apollo-server-env";
-import { GraphQLDataSource } from "@apollo/gateway";
-import createSHA from "apollo-server-core/dist/utils/createSHA";
-import { PersistedQuery } from "./persistedQuery";
+  ApolloError,
+  AuthenticationError,
+  ForbiddenError,
+} from 'apollo-server-errors';
+import {
+  fetch,
+  Request,
+  Headers,
+  Response,
+} from 'apollo-server-env';
+import { GraphQLDataSource } from '@apollo/gateway';
+import createSHA from 'apollo-server-core/dist/utils/createSHA';
 
 function isObject(value: any): value is object {
-    return (
-        value !== undefined &&
-        value !== null &&
-        typeof value === "object" &&
-        !Array.isArray(value)
-    );
+  return (
+      value !== undefined &&
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value)
+  );
 }
 
-export class RemoteGraphQLDataSource<
-    TContext extends Record<string, any> = Record<string, any>
-> implements GraphQLDataSource<TContext> {
-    fetcher: typeof fetch = fetch;
+export class RemoteGraphQLDataSource<TContext extends Record<string, any> = Record<string, any>> implements GraphQLDataSource<TContext> {
+  fetcher: typeof fetch = fetch;
 
-    constructor(
-        config?: Partial<RemoteGraphQLDataSource<TContext>> &
-            object &
-            ThisType<RemoteGraphQLDataSource<TContext>>
-    ) {
-        if (config) {
-            return Object.assign(this, config);
-        }
+  constructor(
+    config?: Partial<RemoteGraphQLDataSource<TContext>> &
+      object &
+      ThisType<RemoteGraphQLDataSource<TContext>>,
+  ) {
+    if (config) {
+      return Object.assign(this, config);
+    }
+  }
+
+  url!: string;
+
+  /**
+   * Whether the downstream request should be made with automated persisted
+   * query (APQ) behavior enabled.
+   *
+   * @remarks When enabled, the request to the downstream service will first be
+   * attempted using a SHA-256 hash of the operation rather than including the
+   * operation itself. If the downstream server supports APQ and has this
+   * operation registered in its APQ storage, it will be able to complete the
+   * request without the entirety of the operation document being transmitted.
+   *
+   * In the event that the downstream service is unaware of the operation, it
+   * will respond with an `PersistedQueryNotFound` error and it will be resent
+   * with the full operation body for fulfillment.
+   *
+   * Generally speaking, when the downstream server is processing similar
+   * operations repeatedly, APQ can offer substantial network savings in terms
+   * of bytes transmitted over the wire between gateways and downstream servers.
+   */
+  apq: boolean = false;
+
+  async process({
+    request,
+    context,
+  }: Pick<GraphQLRequestContext<TContext>, 'request' | 'context'>): Promise<
+    GraphQLResponse
+  > {
+    // Respect incoming http headers (eg, apollo-federation-include-trace).
+    const headers = (request.http && request.http.headers) || new Headers();
+    headers.set('Content-Type', 'application/json');
+
+    request.http = {
+      method: 'POST',
+      url: this.url,
+      headers,
+    };
+
+    if (this.willSendRequest) {
+      await this.willSendRequest({ request, context });
     }
 
-    url!: string;
-
-    /**
-     * Whether the downstream request should be made with automated persisted
-     * query (APQ) behavior enabled.
-     *
-     * @remarks When enabled, the request to the downstream service will first be
-     * attempted using a SHA-256 hash of the operation rather than including the
-     * operation itself. If the downstream server supports APQ and has this
-     * operation registered in its APQ storage, it will be able to complete the
-     * request without the entirety of the operation document being transmitted.
-     *
-     * In the event that the downstream service is unaware of the operation, it
-     * will respond with an `PersistedQueryNotFound` error and it will be resent
-     * with the full operation body for fulfillment.
-     *
-     * Generally speaking, when the downstream server is processing similar
-     * operations repeatedly, APQ can offer substantial network savings in terms
-     * of bytes transmitted over the wire between gateways and downstream servers.
-     */
-    apq = false;
-
-    async process({
-        request,
-        context,
-    }: Pick<GraphQLRequestContext<TContext>, "request" | "context">): Promise<
-        GraphQLResponse
-    > {
-        // Respect incoming http headers (eg, apollo-federation-include-trace).
-        const headers = (request.http && request.http.headers) || new Headers();
-        headers.set("Content-Type", "application/json");
-
-        request.http = {
-            method: "POST",
-            url: this.url,
-            headers,
-        };
-
-        if (!request.query) {
-            throw new Error("Missing query");
-        }
-
-        const apqHash = createSHA("sha256").update(request.query).digest("hex");
-
-        const { query, ...requestWithoutQuery } = request;
-
-        const respond = (response: GraphQLResponse, request: GraphQLRequest) =>
-            typeof this.didReceiveResponse === "function"
-                ? this.didReceiveResponse({ response, request, context })
-                : response;
-
-        if (this.apq) {
-            // Take the original extensions and extend them with
-            // the necessary "extensions" for APQ handshaking.
-            requestWithoutQuery.extensions = {
-                ...request.extensions,
-                persistedQuery: {
-                    version: 1,
-                    sha256Hash: apqHash,
-                },
-            };
-
-            const {
-                newURI: optimisticPersistedQueryUrl,
-                parseError,
-            } = PersistedQuery.rewriteURIForGET(this.url, requestWithoutQuery);
-
-            if (parseError) {
-                throw parseError;
-            }
-
-            if (!optimisticPersistedQueryUrl) {
-                throw new Error(
-                    "Failed to generate persisted query URI from request."
-                );
-            }
-
-            requestWithoutQuery.http = {
-                method: "GET",
-                url: optimisticPersistedQueryUrl,
-                headers,
-            };
-
-            const apqOptimisticResponse = await this.sendRequest(
-                requestWithoutQuery,
-                context
-            );
-
-            // If we didn't receive notice to retry with APQ, then let's
-            // assume this is the best result we'll get and return it!
-            if (
-                !apqOptimisticResponse.errors ||
-                !apqOptimisticResponse.errors.find(
-                    (error) => error.message === "PersistedQueryNotFound"
-                )
-            ) {
-                return respond(apqOptimisticResponse, requestWithoutQuery);
-            }
-
-            // We'll run the same request again, but add in the
-            // previously omitted `query`.
-
-            const requestWithQuery: GraphQLRequest = {
-                query,
-                ...requestWithoutQuery,
-            };
-
-            const {
-                newURI: persistedQueryUrlWithQuery,
-            } = PersistedQuery.rewriteURIForGET(this.url, requestWithQuery);
-
-            if (!persistedQueryUrlWithQuery) {
-                throw new Error(
-                    "Failed to generate persisted query URI from request."
-                );
-            }
-
-            requestWithQuery.http = {
-                method: "GET",
-                url: persistedQueryUrlWithQuery,
-                headers,
-            };
-
-            const response = await this.sendRequest(requestWithQuery, context);
-            return respond(response, requestWithQuery);
-        }
-
-        // APQ was NOT enabled, this is the first request (non-APQ, all the way).
-        const requestWithQuery: GraphQLRequest = {
-            query,
-            ...requestWithoutQuery,
-        };
-        const response = await this.sendRequest(requestWithQuery, context);
-        return respond(response, requestWithQuery);
+    if (!request.query) {
+      throw new Error("Missing query");
     }
 
-    private async sendRequest(
-        request: GraphQLRequest,
-        context: TContext
-    ): Promise<GraphQLResponse> {
-        // This would represent an internal programming error since this shouldn't
-        // be possible in the way that this method is invoked right now.
-        if (!request.http) {
-            throw new Error(
-                "Internal error: Only 'http' requests are supported."
-            );
-        }
+    const apqHash = createSHA('sha256')
+       .update(request.query)
+       .digest('hex');
 
-        if (this.willSendRequest) {
-            await this.willSendRequest({ request, context });
-        }
+    const { query, ...requestWithoutQuery } = request;
 
-        // We don't want to serialize the `http` properties into the body that is
-        // being transmitted.  Instead, we want those to be used to indicate what
-        // we're accessing (e.g. url) and what we access it with (e.g. headers).
-        const { http, ...requestWithoutHttp } = request;
-        const requestBody =
-            request.http.method === "POST"
-                ? JSON.stringify(requestWithoutHttp)
-                : undefined;
-        const fetchRequest = new Request(http.url, {
-            ...http,
-            body: requestBody,
-        });
+    const respond = (response: GraphQLResponse, request: GraphQLRequest) =>
+      typeof this.didReceiveResponse === "function"
+        ? this.didReceiveResponse({ response, request, context })
+        : response;
 
-        let fetchResponse: Response | undefined;
+    if (this.apq) {
+      // Take the original extensions and extend them with
+      // the necessary "extensions" for APQ handshaking.
+      requestWithoutQuery.extensions = {
+        ...request.extensions,
+        persistedQuery: {
+          version: 1,
+          sha256Hash: apqHash,
+        },
+      };
 
-        try {
-            // Use our local `fetcher` to allow for fetch injection
-            // Use the fetcher's `Request` implementation for compatibility
-            fetchResponse = await this.fetcher(http.url, {
-                ...http,
-                body: requestBody,
-            });
+      const {
+        newURI: optimisticPersistedQueryUrl,
+        parseError,
+      } = PersistedQuery.rewriteURIForGET(this.url, requestWithoutQuery);
 
-            if (!fetchResponse.ok) {
-                throw await this.errorFromResponse(fetchResponse);
-            }
+      if (parseError) {
+        throw parseError;
+      }
 
-            const responseBody = await this.parseBody(
-                fetchResponse,
-                fetchRequest,
-                context
-            );
+      const apqOptimisticResponse =
+        await this.sendRequest(requestWithoutQuery, context);
 
-            if (!isObject(responseBody)) {
-                throw new Error(
-                    `Expected JSON response body, but received: ${responseBody}`
-                );
-            }
+      // If we didn't receive notice to retry with APQ, then let's
+      // assume this is the best result we'll get and return it!
+      if (
+        !apqOptimisticResponse.errors ||
+        !apqOptimisticResponse.errors.find(error =>
+          error.message === 'PersistedQueryNotFound')
+      ) {
+        return respond(apqOptimisticResponse, requestWithoutQuery);
+      }
 
-            return {
-                ...responseBody,
-                http: fetchResponse,
-            };
-        } catch (error) {
-            this.didEncounterError(error, fetchRequest, fetchResponse);
-            throw error;
-        }
+      // We'll run the same request again, but add in the
+      // previously omitted `query`.
+      const requestWithQuery: GraphQLRequest = {
+        query,
+        ...requestWithoutQuery,
+      };
+
+      const {
+        newURI: persistedQueryUrlWithQuery,
+      } = PersistedQuery.rewriteURIForGET(this.url, requestWithQuery);
+
+      if (!persistedQueryUrlWithQuery) {
+        throw new Error(
+          "Failed to generate persisted query URI from request."
+        );
+      }
+
+      requestWithQuery.http = {
+        method: "GET",
+          url: persistedQueryUrlWithQuery,
+          headers,
+      };
+
+      const response = await this.sendRequest(requestWithQuery, context);
+      return respond(response, requestWithQuery);
     }
 
-    public willSendRequest?(
-        requestContext: Pick<
-            GraphQLRequestContext<TContext>,
-            "request" | "context"
-        >
-    ): ValueOrPromise<void>;
+    // APQ was NOT enabled, this is the first request (non-APQ, all the way).
+    const requestWithQuery: GraphQLRequest = {
+      query,
+      ...requestWithoutQuery,
+    };
+    const response = await this.sendRequest(requestWithQuery, context);
+    return respond(response, requestWithQuery);
+  }
 
-    public didReceiveResponse?(
-        requestContext: Required<
-            Pick<
-                GraphQLRequestContext<TContext>,
-                "request" | "response" | "context"
-            >
-        >
-    ): ValueOrPromise<GraphQLResponse>;
+  private async sendRequest(
+    request: GraphQLRequest,
+    context: TContext,
+  ): Promise<GraphQLResponse> {
 
-    public didEncounterError(
-        error: Error,
-        _fetchRequest: Request,
-        _fetchResponse?: Response
-    ) {
-        throw error;
+    // This would represent an internal programming error since this shouldn't
+    // be possible in the way that this method is invoked right now.
+    if (!request.http) {
+      throw new Error("Internal error: Only 'http' requests are supported.")
     }
 
-    public parseBody(
-        fetchResponse: Response,
-        _fetchRequest?: Request,
-        _context?: TContext
-    ): Promise<object | string> {
-        const contentType = fetchResponse.headers.get("Content-Type");
-        if (contentType && contentType.startsWith("application/json")) {
-            return fetchResponse.json();
-        }
-        return fetchResponse.text();
+    // We don't want to serialize the `http` properties into the body that is
+    // being transmitted.  Instead, we want those to be used to indicate what
+    // we're accessing (e.g. url) and what we access it with (e.g. headers).
+    const { http, ...requestWithoutHttp } = request;
+    const fetchRequest = new Request(http.url, {
+      ...http,
+      body: JSON.stringify(requestWithoutHttp),
+    });
+
+    let fetchResponse: Response | undefined;
+
+    try {
+      // Use our local `fetcher` to allow for fetch injection
+      // Use the fetcher's `Request` implementation for compatibility
+      fetchResponse = await this.fetcher(http.url, {
+        ...http,
+        body: JSON.stringify(requestWithoutHttp)
+      });
+
+      if (!fetchResponse.ok) {
+        throw await this.errorFromResponse(fetchResponse);
+      }
+
+      const body = await this.parseBody(fetchResponse, fetchRequest, context);
+
+      if (!isObject(body)) {
+        throw new Error(`Expected JSON response body, but received: ${body}`);
+      }
+
+      return {
+        ...body,
+        http: fetchResponse,
+      };
+    } catch (error) {
+      this.didEncounterError(error, fetchRequest, fetchResponse);
+      throw error;
+    }
+  }
+
+  public willSendRequest?(
+    requestContext: Pick<
+      GraphQLRequestContext<TContext>,
+      'request' | 'context'
+    >,
+  ): ValueOrPromise<void>;
+
+  public didReceiveResponse?(
+    requestContext: Required<Pick<
+      GraphQLRequestContext<TContext>,
+      'request' | 'response' | 'context'>
+    >,
+  ): ValueOrPromise<GraphQLResponse>;
+
+  public didEncounterError(
+    error: Error,
+    _fetchRequest: Request,
+    _fetchResponse?: Response
+  ) {
+    throw error;
+  }
+
+  public parseBody(
+    fetchResponse: Response,
+    _fetchRequest?: Request,
+    _context?: TContext,
+  ): Promise<object | string> {
+    const contentType = fetchResponse.headers.get('Content-Type');
+    if (contentType && contentType.startsWith('application/json')) {
+      return fetchResponse.json();
+    } else {
+      return fetchResponse.text();
+    }
+  }
+
+  public async errorFromResponse(response: Response) {
+    const message = `${response.status}: ${response.statusText}`;
+
+    let error: ApolloError;
+    if (response.status === 401) {
+      error = new AuthenticationError(message);
+    } else if (response.status === 403) {
+      error = new ForbiddenError(message);
+    } else {
+      error = new ApolloError(message);
     }
 
-    public async errorFromResponse(response: Response) {
-        const message = `${response.status}: ${response.statusText}`;
+    const body = await this.parseBody(response);
 
-        let error: ApolloError;
-        if (response.status === 401) {
-            error = new AuthenticationError(message);
-        } else if (response.status === 403) {
-            error = new ForbiddenError(message);
-        } else {
-            error = new ApolloError(message);
-        }
+    Object.assign(error.extensions, {
+      response: {
+        url: response.url,
+        status: response.status,
+        statusText: response.statusText,
+        body,
+      },
+    });
 
-        const body = await this.parseBody(response);
-
-        Object.assign(error.extensions, {
-            response: {
-                url: response.url,
-                status: response.status,
-                statusText: response.statusText,
-                body,
-            },
-        });
-
-        return error;
-    }
+    return error;
+  }
 }
