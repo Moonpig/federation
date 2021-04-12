@@ -21,4 +21,4 @@ tracing = "0.1.21"
 tracing-futures = "0.2.4"
 
 [dev-dependencies]
-gherkin_rust = "0.8.3"
+gherkin_rust = "0.10.1"
